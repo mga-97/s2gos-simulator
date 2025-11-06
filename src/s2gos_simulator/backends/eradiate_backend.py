@@ -554,6 +554,98 @@ class EradiateBackend(SimulationBackend):
                     f"Available materials: {available}"
                 )
 
+    def _create_transform_matrices(self, vegetation_data):
+        """
+        Vectorized conversion of transform data to 4x4 transformation matrices.
+        
+        Args:
+            vegetation_data: Structured numpy array with fields: x, y, z, rotation, scale, tilt_x, tilt_y
+        
+        Returns:
+            np.ndarray: Array of shape (N, 4, 4) containing transformation matrices
+        """
+        N = len(vegetation_data)
+
+        # Extract data
+        x = vegetation_data['x'].astype(np.float64)
+        y = vegetation_data['y'].astype(np.float64)
+        z = vegetation_data['z'].astype(np.float64)
+        rotation = vegetation_data['rotation'].astype(np.float64)
+        scale = vegetation_data['scale'].astype(np.float64)
+        tilt_x = vegetation_data['tilt_x'].astype(np.float64) if 'tilt_x' in vegetation_data.dtype.names else np.zeros(N)
+        tilt_y = vegetation_data['tilt_y'].astype(np.float64) if 'tilt_y' in vegetation_data.dtype.names else np.zeros(N)
+
+        # Convert degrees to radians
+        rotation_rad = np.deg2rad(rotation)
+        tilt_x_rad = np.deg2rad(tilt_x)
+        tilt_y_rad = np.deg2rad(tilt_y)
+        rot_90_rad = np.deg2rad(90)
+
+        # Pre-compute sin/cos values for all rotations
+        cos_90 = np.cos(rot_90_rad)
+        sin_90 = np.sin(rot_90_rad)
+        cos_rot = np.cos(rotation_rad)
+        sin_rot = np.sin(rotation_rad)
+        cos_tilt_x = np.cos(tilt_x_rad)
+        sin_tilt_x = np.sin(tilt_x_rad)
+        cos_tilt_y = np.cos(tilt_y_rad)
+        sin_tilt_y = np.sin(tilt_y_rad)
+
+        # Initialize matrices (N, 4, 4) as identity
+        matrices = np.zeros((N, 4, 4), dtype=np.float64)
+        matrices[:, 3, 3] = 1
+
+        # 1. Translation matrix
+        T = np.eye(4, dtype=np.float64)[None, :, :].repeat(N, axis=0)
+        T[:, 0, 3] = x
+        T[:, 1, 3] = y
+        T[:, 2, 3] = z
+
+        # 2. Rotation around X-axis by 90 degrees
+        Rx90 = np.eye(4, dtype=np.float64)[None, :, :].repeat(N, axis=0)
+        Rx90[:, 1, 1] = cos_90
+        Rx90[:, 1, 2] = -sin_90
+        Rx90[:, 2, 1] = sin_90
+        Rx90[:, 2, 2] = cos_90
+
+        # 3. Rotation around Y-axis by rotation angle
+        Ry = np.eye(4, dtype=np.float64)[None, :, :].repeat(N, axis=0)
+        Ry[:, 0, 0] = cos_rot
+        Ry[:, 0, 2] = sin_rot
+        Ry[:, 2, 0] = -sin_rot
+        Ry[:, 2, 2] = cos_rot
+
+        # 4. Rotation around X-axis by tilt_x
+        Rx = np.eye(4, dtype=np.float64)[None, :, :].repeat(N, axis=0)
+        Rx[:, 1, 1] = cos_tilt_x
+        Rx[:, 1, 2] = -sin_tilt_x
+        Rx[:, 2, 1] = sin_tilt_x
+        Rx[:, 2, 2] = cos_tilt_x
+
+        # 5. Rotation around Y-axis by tilt_y
+        Ry_tilt = np.eye(4, dtype=np.float64)[None, :, :].repeat(N, axis=0)
+        Ry_tilt[:, 0, 0] = cos_tilt_y
+        Ry_tilt[:, 0, 2] = sin_tilt_y
+        Ry_tilt[:, 2, 0] = -sin_tilt_y
+        Ry_tilt[:, 2, 2] = cos_tilt_y
+
+        # 6. Scale matrix
+        S = np.eye(4, dtype=np.float64)[None, :, :].repeat(N, axis=0)
+        S[:, 0, 0] = scale
+        S[:, 1, 1] = scale
+        S[:, 2, 2] = scale
+
+        # Compose transformations: T @ Rx90 @ Ry @ Rx @ Ry_tilt @ S
+        # Using einsum for vectorized matrix multiplication
+        result = T
+        result = np.einsum('nij,njk->nik', result, Rx90)
+        result = np.einsum('nij,njk->nik', result, Ry)
+        result = np.einsum('nij,njk->nik', result, Rx)
+        result = np.einsum('nij,njk->nik', result, Ry_tilt)
+        result = np.einsum('nij,njk->nik', result, S)
+
+        return result
+
     def _expand_vegetation_collection(
         self, vegetation_collection_obj: dict, scene_dir: UPath, kdict: dict
     ):
@@ -579,39 +671,48 @@ class EradiateBackend(SimulationBackend):
                 f"Expanding vegetation collection '{collection_name}' with {count} instances"
             )
 
-            for i in range(count):
-                instance_id = f"vegetation_instance_{collection_name}_{i}"
+            to_worlds = self._create_transform_matrices(vegetation_data)
+            to_worlds = np.transpose(a=to_worlds, axes=(0,2,1))
 
-                x, y, z = (
-                    float(vegetation_data[i]["x"]),
-                    float(vegetation_data[i]["y"]),
-                    float(vegetation_data[i]["z"]),
-                )
-                rotation = float(vegetation_data[i]["rotation"])
-                scale = float(vegetation_data[i]["scale"])
-                tilt_x = (
-                    float(vegetation_data[i]["tilt_x"])
-                    if "tilt_x" in vegetation_data.dtype.names
-                    else 0.0
-                )
-                tilt_y = (
-                    float(vegetation_data[i]["tilt_y"])
-                    if "tilt_y" in vegetation_data.dtype.names
-                    else 0.0
-                )
+            kdict[f"VIs_{collection_name}"] ={
+                "type":"instancelist",
+                "shapegroup":{"type": "ref", "id": shapegroup_ref},
+                "transforms":to_worlds,
+            } 
 
-                to_world = mi.ScalarTransform4f.translate([x, y, z])
-                to_world = to_world @ mi.ScalarTransform4f.rotate([1, 0, 0], 90)
-                to_world = to_world @ mi.ScalarTransform4f.rotate([0, 1, 0], rotation)
-                to_world = to_world @ mi.ScalarTransform4f.rotate([1, 0, 0], tilt_x)
-                to_world = to_world @ mi.ScalarTransform4f.rotate([0, 1, 0], tilt_y)
-                to_world = to_world @ mi.ScalarTransform4f.scale(scale)
+            # for i in range(count):
+            #     instance_id = f"vegetation_instance_{collection_name}_{i}"
 
-                kdict[instance_id] = {
-                    "type": "instance",
-                    "shapegroup": {"type": "ref", "id": shapegroup_ref},
-                    "to_world": to_world,
-                }
+            #     x, y, z = (
+            #         float(vegetation_data[i]["x"]),
+            #         float(vegetation_data[i]["y"]),
+            #         float(vegetation_data[i]["z"]),
+            #     )
+            #     rotation = float(vegetation_data[i]["rotation"])
+            #     scale = float(vegetation_data[i]["scale"])
+            #     tilt_x = (
+            #         float(vegetation_data[i]["tilt_x"])
+            #         if "tilt_x" in vegetation_data.dtype.names
+            #         else 0.0
+            #     )
+            #     tilt_y = (
+            #         float(vegetation_data[i]["tilt_y"])
+            #         if "tilt_y" in vegetation_data.dtype.names
+            #         else 0.0
+            #     )
+
+            #     to_world = mi.ScalarTransform4f.translate([x, y, z])
+            #     to_world = to_world @ mi.ScalarTransform4f.rotate([1, 0, 0], 90)
+            #     to_world = to_world @ mi.ScalarTransform4f.rotate([0, 1, 0], rotation)
+            #     to_world = to_world @ mi.ScalarTransform4f.rotate([1, 0, 0], tilt_x)
+            #     to_world = to_world @ mi.ScalarTransform4f.rotate([0, 1, 0], tilt_y)
+            #     to_world = to_world @ mi.ScalarTransform4f.scale(scale)
+
+            #     kdict[instance_id] = {
+            #         "type": "instance",
+            #         "shapegroup": {"type": "ref", "id": shapegroup_ref},
+            #         "to_world": to_world,
+            #     }
 
         except Exception as e:
             logging.error(
@@ -625,7 +726,7 @@ class EradiateBackend(SimulationBackend):
         self._current_scene_dir = scene_dir
         self._current_scene_description = scene_description
 
-        kdict = {}
+        kdict = eradiate.kernel.KernelDict()
         kpmap = {}
         adapter = EradiateMaterialAdapter()
 
